@@ -1,0 +1,263 @@
+Выбор и настройка мониторинга в системе
+
+1. Мотивация
+
+Яндекс.Метрика показывает поведение пользователей на сайте, но не отвечает на ключевые вопросы, которые возникли после открытия B2B API и роста нагрузки:
+- где “теряются” заказы: между сервисами и в RabbitMQ;
+- что является источником деградации: MES API, очереди, БД, S3;
+- почему “первая страница MES долго грузится”: проблема latency, DB connections, CPU/memory, in-flight сообщений;
+- какие партнёры/пользователи создают пиковую нагрузку (per user RPS).
+
+Ценность для бизнеса:
+- меньше потерянных заказов и контрактов (раннее обнаружение проблем);
+- ниже время реакции на инциденты (MTTR);
+- управляемое масштабирование (видим насыщение до падения);
+- возможность обосновывать приоритеты разработки данными (какой узел реально болит).
+
+2. Выбор подхода к мониторингу
+
+Используем комбинацию:
+- RED для API (Shop/CRM/MES): RPS, ошибки, latency.
+- USE для ресурсов (CPU, memory, DB connections/size, RabbitMQ in-flight/DLQ).
+- технические метрики трафика (KB sent/received), чтобы видеть аномалии передачи 3D и влияние партнёров.
+
+3. Метрики (из списка): зачем и какие ярлыки (labels)
+Отмети метрики как:
+- MUST — обязательно на старте,
+- SHOULD — желательно (быстро даёт ценность),
+- COULD — опционально/второй этап.
+
+RabbitMQ (интеграция заказов/статусов)
+1) Number of dead-letter-exchange letters in RabbitMQ — MUST
+Зачем: прямой индикатор “сообщения не обработались и ушли в DLX/DLQ” → заказы/статусы не доходят, растут жалобы.
+Labels:
+- queue (или dlq_queue)
+- exchange
+- routing_key (если доступно)
+- env
+
+2) Number of message in flight in RabbitMQ — MUST
+(обычно это unacked / “в полёте”)
+Зачем: если растёт — консьюмеры берут сообщения, но долго не подтверждают (зависают, падают, медленно обрабатывают). Это часто причина “заказы не появляются”.
+Labels:
+- queue
+- consumer (если можно)
+- env
+
+API (RED): нагрузка, ошибки, задержки
+
+3) Number of requests (RPS) for internet shop API — MUST
+Зачем: базовая нагрузка B2C; нужна для корреляции с ошибками и latency.
+Labels: route, method, status_code (если возможно), env
+
+4) Number of requests (RPS) for CRM API — MUST
+Зачем: рост CRM RPS часто означает рост заказов/операций менеджеров + возможные пики из интеграции.
+Labels: route, method, status_code, env
+
+5) Number of requests (RPS) for MES API — MUST
+Зачем: ключевой сервис для расчёта цены и операторов; после открытия API важен контроль трафика.
+Labels: route, method, status_code, env, client_id (API key / партнёр), source (B2B/B2C — если различимо)
+
+3.3 API: RPS per user (защита от “шумных” клиентов)
+
+6) Number of requests (RPS) per user for internet shop API — SHOULD
+Зачем: поиск злоупотреблений/аномалий (боты, DoS, скрипты), сегментация нагрузки.
+Labels: user_id (или anon_id), route, env
+
+7) Number of requests (RPS) per user for CRM API — SHOULD
+Зачем: выявление “тяжёлых” пользователей/скриптов, которые создают нагрузку на CRM.
+Labels: user_id, route, env
+
+8) Number of requests (RPS) per user for MES API — MUST (для B2B)
+Зачем: контроль партнёров; основа для квот/rate limit и расследований жалоб.
+Labels: client_id (обязательно), route, env
+
+3.4 Ошибки HTTP (лучше как rate, но из списка — счётчики)
+
+9) Number of HTTP 200 for shop API — SHOULD
+Зачем: baseline успешных ответов; полезно для конверсии на уровне API и для вычисления error rate.
+Labels: route, method, env
+
+10) Number of HTTP 200 for CRM API — SHOULD
+Labels: route, method, env
+
+11) Number of HTTP 200 for MES API — SHOULD
+Labels: route, method, env, client_id (для B2B)
+
+12) Number of HTTP 500 for shop API — MUST
+Зачем: 5xx = техническая проблема сервиса/зависимостей. Рост коррелирует с потерями заказов.
+Labels: route, method, exception (если возможно), env
+
+13) Number of HTTP 500 for CRM API — MUST
+Labels: route, method, exception, env
+
+14) Number of HTTP 500 for MES API — MUST
+Labels: route, method, exception, env, client_id
+
+3.5 Latency (время ответа) — критично для “долго грузится”
+
+15) Response time (latency) for shop API — MUST
+Зачем: показывает деградацию; важны p95/p99, не только среднее.
+Labels: route, method, env
+
+16) Response time (latency) for CRM API — MUST
+Labels: route, method, env
+
+17) Response time (latency) for MES API — MUST
+Зачем: влияет и на операторов, и на партнёров; рост latency часто предвестник лавины ошибок/очередей.
+Labels: route, method, env, client_id
+
+3.6 Насыщение приложений (USE)
+
+18) CPU % for shop API — MUST
+Зачем: определяет, упираемся ли в compute; база для решения “scale up/out”.
+Labels: instance, env
+
+19) CPU % for CRM API — MUST
+Labels: instance, env
+
+20) CPU % for MES API — MUST
+Labels: instance, env
+
+21) Memory Utilisation for shop API — MUST
+Зачем: риск OOM/restart, утечки, ухудшение latency из-за GC (Java).
+Labels: instance, env
+
+22) Memory Utilisation for CRM API — MUST
+Labels: instance, env
+
+23) Memory Utilisation for MES API — MUST
+Labels: instance, env
+
+3.7 БД (PostgreSQL): ресурсы и коннекты
+
+24) Memory Utilisation for shop db instance — MUST
+Зачем: при нехватке памяти падает cache hit ratio → растёт latency запросов/страниц.
+Labels: db=shop, env
+
+25) Memory Utilisation for MES db instance — MUST
+Labels: db=mes, env
+
+26) Number of connections for shop db instance — MUST
+Зачем: исчерпание коннектов = деградация/ошибки. Часто причина массовых 500.
+Labels: db=shop, env
+
+27) Number of connections for MES db instance — MUST
+Labels: db=mes, env
+
+28) Size of shop db instance — COULD
+Зачем: прогнозирование роста хранения и планирование обслуживания/шардирования; не первичный индикатор инцидента, но важен для capacity planning.
+Labels: db=shop, env
+
+29) Size of MES db instance — COULD
+Labels: db=mes, env
+
+3.8 S3 storage
+
+30) Size of S3 storage — COULD
+Зачем: контроль затрат и роста хранилища 3D-файлов; косвенно — риск квот/лимитов.
+Labels: bucket, env
+
+3.9 “Simultaneous sessions” (конкурентность)
+
+31) Number of simultanious sessions for shop API — SHOULD
+Зачем: показатель конкурентной нагрузки (аналог in-flight HTTP). Полезен, если корректно измеряется на уровне сервиса/балансера.
+Labels: instance (или lb), env
+
+32) Number of simultanious sessions for CRM API — SHOULD
+Labels: instance/lb, env
+
+33) Number of simultanious sessions for MES API — MUST
+Зачем: MES страдает от пиков; concurrent sessions помогают отличить “много запросов коротких” от “мало, но висят долго”.
+Labels: instance/lb, env, client_id (если возможно)
+
+3.10 Трафик (KB received/sent)
+
+Эти метрики полезны для:
+- аномалий (внезапно огромные ответы/запросы),
+- корреляции с загрузкой 3D/интеграцией,
+- расчёта стоимости инфраструктуры.
+
+34) Kb tranferred (received) for shop API — SHOULD
+Зачем: контроль входящего трафика (особенно при загрузке 3D/данных конструктора).
+Labels: route, env
+
+35) Kb tranferred (received) for CRM API — COULD
+Labels: route, env
+
+36) Kb tranferred (received) for MES API — SHOULD
+Labels: route, env, client_id
+
+37) Kb provided (sent) for shop API — SHOULD
+Labels: route, env
+
+38) Kb provided (sent) for CRM API — COULD
+Labels: route, env
+
+39) Kb provided (sent) for MES API — SHOULD
+Labels: route, env, client_id
+
+Метрики, которых нет в списке, но их стоит добавить (коротко)
+1) Queue depth (messages ready) в RabbitMQ
+В списке есть DLX letters и in-flight, но нет “сколько ждёт в очереди”. Без этого сложно видеть накопление отставания.
+
+2) Redelivered rate в RabbitMQ
+Показывает повторные доставки → частые сбои консьюмеров/ack.
+
+3) DB query latency / slow queries (особенно для MES DB)
+Ключ к проблеме “первая страница MES грузится долго”.
+
+4) Бизнес-метрики: время прохождения статусов, stuck orders
+Именно они напрямую отвечают на “почему просрочки”.
+
+6. План действий
+
+1) Определить стек мониторинга (метрики/логи/алёрты)
+- Time-series хранилище метрик + визуализация дашбордов
+- Алёртинг в чат/почту + интеграция с трекером задач
+
+2) Сбор метрик по списку
+- API: RPS, latency, 200/500, concurrent sessions, KB in/out
+- RabbitMQ: DLX letters, in-flight (и желательно queue depth)
+- БД: memory utilization, connections, db size
+- Инстансы: CPU%, memory utilization
+
+3) Инструментирование “per user RPS”
+- Shop/CRM: user_id из токена
+- MES B2B: client_id (API key) как главный label
+Важно: ограничить кардинальность (например, топ-N клиентов + агрегат “other”), чтобы не взорвать метрики.
+
+4) Дашборды
+- “API health” по трём API
+- “RabbitMQ health” (DLX, in-flight, consumers)
+- “DB health” (connections/memory)
+- “B2B clients” (MES API RPS/500/latency по client_id)
+
+5) Алёрты + runbooks
+- DLX > 0 (warning) / DLX растёт (critical)
+- in-flight растёт 10–15 минут
+- p95 latency MES API > порога
+- HTTP 500 rate > порога
+- DB connections > 80% лимита
+
+7. (Доп.) Показатели насыщенности: пороги и реакция
+
+Ниже — стартовые пороги (после 2–4 недель лучше пересмотреть по фактической “норме”).
+
+7.1 API CPU/Memory
+- CPU > 80% 15 минут → warning, > 90% 10 минут → critical
+Действие: тикет + масштабирование (вертикальное/горизонтальное), профилирование.
+
+- Memory utilisation > 85% 15 минут → warning, > 95% → critical
+Действие: тикет + поиск утечек/настройка heap/лимитов.
+
+7.2 RabbitMQ
+- DLX letters > 0 → warning, рост DLX > N/мин → critical
+Действие: инцидент; разбор ошибок консьюмеров; при необходимости — временно снизить поток (rate limit) или включить деградацию.
+
+- in-flight messages растёт 15 минут → critical
+Действие: проверить консьюмеров, увеличить число консьюмеров/инстансов, проверить зависшие операции.
+
+7.3 PostgreSQL connections
+- connections > 80% лимита 10 минут → critical
+Действие: инцидент; найти утечки коннектов, ограничить параллелизм, настроить пул, рассмотреть read-replica.
